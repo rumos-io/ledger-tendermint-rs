@@ -13,7 +13,7 @@
 *  See the License for the specific language governing permissions and
 *  limitations under the License.
 ********************************************************************************/
-//! Provider for Ledger Tendermint validator app
+//! Provider for Ledger Cosmos validator app
 
 #[macro_use]
 extern crate quick_error;
@@ -77,11 +77,11 @@ quick_error! {
     }
 }
 
-pub struct TendermintValidatorApp {
+pub struct CosmosValidatorApp {
     app: ledger::LedgerApp,
 }
 
-unsafe impl Send for TendermintValidatorApp {}
+unsafe impl Send for CosmosValidatorApp {}
 
 #[allow(dead_code)]
 pub struct Version {
@@ -91,10 +91,10 @@ pub struct Version {
     patch: u8,
 }
 
-impl TendermintValidatorApp {
+impl CosmosValidatorApp {
     pub fn connect() -> Result<Self, Error> {
         let app = ledger::LedgerApp::new()?;
-        Ok(TendermintValidatorApp { app })
+        Ok(CosmosValidatorApp { app })
     }
 
     pub fn version(&self) -> Result<Version, Error> {
@@ -208,11 +208,11 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Instant;
 
-    use crate::{Error, TendermintValidatorApp};
+    use crate::{CosmosValidatorApp, Error};
 
     lazy_static! {
-        static ref APP: Mutex<TendermintValidatorApp> =
-            Mutex::new(TendermintValidatorApp::connect().unwrap());
+        static ref APP: Mutex<CosmosValidatorApp> =
+            Mutex::new(CosmosValidatorApp::connect().unwrap());
     }
 
     fn get_fake_proposal(index: u64, round: i64) -> Vec<u8> {

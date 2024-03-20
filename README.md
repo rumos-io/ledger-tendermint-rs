@@ -1,1 +1,1 @@
-# ledger-tendermint-rs
+# ledger-cosmos-rs
