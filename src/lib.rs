@@ -35,14 +35,22 @@ extern crate lazy_static;
 extern crate byteorder;
 extern crate ledger;
 
-use self::ledger::{ApduAnswer, ApduCommand};
+use byteorder::{LittleEndian, WriteBytesExt};
+use ledger::{ApduAnswer, ApduCommand};
+use std::io::BufWriter;
 
-const CLA: u8 = 0x56;
+const CLA: u8 = 0x55; // Use 0x55 for the user App (0x56 for the validator app) see https://github.com/cosmos/ledger-cosmos-go/blob/a4f5d0465791fc1cb2d6543f861833ab510d9801/user_app.go#L28
 const INS_GET_VERSION: u8 = 0x00;
 const INS_PUBLIC_KEY_ED25519: u8 = 0x01;
+const INS_PUBLIC_KEY_SECP256K1: u8 = 0x04;
 const INS_SIGN_ED25519: u8 = 0x02;
+const INS_SIGN_SECP256K1: u8 = 0x02;
 
 const USER_MESSAGE_CHUNK_SIZE: usize = 250;
+
+const PATH: [u32; 5] = [44, 118, 0, 0, 0]; // BIP44 path, must match https://github.com/rumos-io/gears/blob/a40fb526a3fff00db336346bb124bac69cedffc0/keyring/src/key_pair/secp256k1_key_pair.rs#L17
+const HARDENED_COUNT: usize = 3; // https://github.com/cosmos/ledger-cosmos-go/blob/a4f5d0465791fc1cb2d6543f861833ab510d9801/user_app.go#L161
+const HRP: &[u8; 6] = b"cosmos";
 
 quick_error! {
     #[derive(Debug)]
@@ -83,12 +91,35 @@ pub struct CosmosValidatorApp {
 
 unsafe impl Send for CosmosValidatorApp {}
 
+#[derive(Debug)]
 #[allow(dead_code)]
 pub struct Version {
     mode: u8,
     major: u8,
     minor: u8,
     patch: u8,
+}
+
+// Based on https://github.com/cosmos/ledger-cosmos-go/blob/a4f5d0465791fc1cb2d6543f861833ab510d9801/common.go#L92C1-L106C2
+fn get_bip32_bytes_v2() -> [u8; 20] {
+    let mut path = PATH.to_vec();
+    for (index, i) in &mut path.iter_mut().enumerate() {
+        if index < HARDENED_COUNT {
+            *i |= 0x8000_0000;
+        }
+    }
+
+    let mut message = [0u8; 20];
+    {
+        let mut writer = BufWriter::new(&mut message[..]);
+        for v in path {
+            writer
+                .write_u32::<LittleEndian>(v)
+                .expect("path is 5*4=20 bytes long and the write buffer is 20 bytes long");
+        }
+    }
+
+    message
 }
 
 impl CosmosValidatorApp {
@@ -153,6 +184,98 @@ impl CosmosValidatorApp {
                 return Err(Error::Ledger(err));
             }
         }
+    }
+
+    /// Returns the pubkey (compressed)
+    pub fn public_key_secp256k1(&self) -> Result<[u8; 33], Error> {
+        let bip32path = get_bip32_bytes_v2();
+
+        let mut data = vec![HRP.len() as u8];
+        data.extend(HRP);
+        data.extend(bip32path);
+        let data_length = data.len();
+
+        let command = ApduCommand {
+            cla: CLA,
+            ins: INS_PUBLIC_KEY_SECP256K1,
+            p1: 0x00, // require confirmation y/n
+            p2: 0x00,
+            length: data_length as u8,
+            data,
+        };
+
+        let response = self.app.exchange(command)?;
+
+        if response.retcode != 0x9000 {
+            println!("WARNING: retcode={:X?}", response.retcode);
+        }
+
+        if response.data.len() < 35 + data_length {
+            return Err(Error::InvalidPK);
+        }
+
+        //let addr = response.data.get(33..).expect("data slice has length > 33");
+        //let addr = String::from_utf8_lossy(addr);
+
+        let mut pub_key = [0u8; 33];
+        pub_key.copy_from_slice(&response.data.get(..33).expect("data slice has length > 33"));
+        Ok(pub_key)
+    }
+
+    // Based on https://github.com/cosmos/ledger-cosmos-go/blob/a4f5d0465791fc1cb2d6543f861833ab510d9801/user_app.go#L225
+    pub fn sign_v2(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
+        let bip32path = get_bip32_bytes_v2();
+
+        let command = ApduCommand {
+            cla: CLA,
+            ins: INS_SIGN_SECP256K1,
+            p1: 0x00,
+            p2: 0x01,
+            length: 20u8,
+            data: bip32path.into(),
+        };
+
+        let _response = self.app.exchange(command)?;
+
+        let chunks = message.chunks(USER_MESSAGE_CHUNK_SIZE);
+        let packet_count = chunks.len();
+
+        if packet_count > 255 {
+            return Err(Error::InvalidMessageSize);
+        }
+
+        if packet_count == 0 {
+            return Err(Error::InvalidEmptyMessage);
+        }
+
+        let mut response: ApduAnswer = ApduAnswer {
+            data: vec![],
+            retcode: 0,
+        };
+
+        let mut payload_desc = 1;
+        // Send message chunks
+        for (packet_idx, chunk) in chunks.enumerate() {
+            if packet_idx == packet_count - 1 {
+                payload_desc = 2;
+            }
+            let command = ApduCommand {
+                cla: CLA,
+                ins: INS_SIGN_SECP256K1,
+                p1: payload_desc,
+                p2: 0x01, // only values of SIGN_MODE_LEGACY_AMINO (P2=0) and SIGN_MODE_TEXTUAL (P2=1) are allowed
+                length: chunk.len() as u8,
+                data: chunk.to_vec(),
+            };
+            response = self.app.exchange(command)?;
+        }
+
+        if response.data.len() == 0 && response.retcode == 0x9000 {
+            return Err(Error::NoSignature);
+        }
+
+        // response data is not a fixed length,see https://bitcoin.stackexchange.com/questions/77191/what-is-the-maximum-size-of-a-der-encoded-ecdsa-signature
+        Ok(response.data)
     }
 
     // Sign message
